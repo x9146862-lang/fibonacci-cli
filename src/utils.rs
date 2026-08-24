@@ -41,6 +41,9 @@ mod tests {
     fn test_fibonacci_sequence() {
         assert_eq!(fibonacci_sequence(0), Vec::<u64>::new());
         assert_eq!(fibonacci_sequence(7), vec![0, 1, 1, 2, 3, 5, 8]);
-        assert_eq!(fibonacci_sequence(10), vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34]);
+        assert_eq!(
+            fibonacci_sequence(10),
+            vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+        );
     }
 }

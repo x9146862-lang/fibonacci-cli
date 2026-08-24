@@ -4,12 +4,18 @@
 //! - `spawn`：提交一个异步任务，立即拿到 `TaskHandle`
 //! - `cancel`：取消单个或全部任务（协作式信号，另有 abort 强制中止）
 //! - `await_task`：等待任务结束并取回结果
+//! - `status` / `result`：查询任务状态、读取已完成任务的结果
 //!
-//! 只依赖 tokio，可作为独立模块通过 `mod concurrent_task_pool;` 引用，
-//! 不需要整合进任何服务框架。
+//! 只依赖 tokio，不引入任何 HTTP 依赖，可作为独立模块被引用。
 
+// 本模块是 bin crate 的公共 API 模块：cancel/abort/await/len 等能力
+// 当前未被 HTTP 层全部调用，但属于对外接口，故允许 dead_code。
+#![allow(dead_code)]
+
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, watch};
@@ -18,15 +24,41 @@ use tokio::task::AbortHandle;
 /// 任务的唯一标识。
 pub type TaskId = u64;
 
+/// 任务状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    /// 任务仍在运行。
+    Running,
+    /// 任务已完成，结果可通过 [`TaskPool::result`] 查询。
+    Completed,
+}
+
+/// 任务运行时的共享状态：状态 + 可选结果。
+struct TaskState {
+    status: TaskStatus,
+    result: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl TaskState {
+    fn new() -> Self {
+        Self {
+            status: TaskStatus::Running,
+            result: None,
+        }
+    }
+}
+
 /// 每个任务的登记信息（只放在池内部）。
 struct TaskEntry {
     /// 取消信号发送端：send(true) 即请求取消。
     cancel: watch::Sender<bool>,
     /// 强制中止句柄：abort() 直接杀掉任务。
     abort: AbortHandle,
+    /// 共享状态，供池外部查询。
+    state: Arc<Mutex<TaskState>>,
 }
 
-/// 池的内部状态，用 Arc 共享给每个任务，任务结束后自动注销自己。
+/// 池的内部状态，用 Arc 共享给每个任务。
 struct Inner {
     tasks: Mutex<HashMap<TaskId, TaskEntry>>,
     next_id: AtomicU64,
@@ -50,19 +82,23 @@ impl TaskPool {
     /// 提交一个异步任务，立即返回句柄，不阻塞。
     ///
     /// 任务被包在 `tokio::select!` 里：要么正常完成、要么响应取消信号。
+    /// 任务完成后会保留在池中（状态为 [`TaskStatus::Completed`]），
+    /// 以便通过 [`TaskPool::status`] / [`TaskPool::result`] 查询。
     pub fn spawn<F, T>(&self, fut: F) -> TaskHandle<T>
     where
         F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        T: Send + Sync + 'static,
     {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (result_tx, result_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let state = Arc::new(Mutex::new(TaskState::new()));
 
         let worker = tokio::spawn(run_task(
             fut,
             cancel_rx,
-            result_tx,
+            done_tx,
+            state.clone(),
             self.inner.clone(),
             id,
         ));
@@ -72,6 +108,7 @@ impl TaskPool {
             TaskEntry {
                 cancel: cancel_tx.clone(),
                 abort: worker.abort_handle(),
+                state: state.clone(),
             },
         );
 
@@ -79,15 +116,16 @@ impl TaskPool {
             id,
             cancel: cancel_tx,
             abort: worker.abort_handle(),
-            rx: result_rx,
+            rx: done_rx,
+            state,
             inner: self.inner.clone(),
+            _marker: PhantomData,
         }
     }
 
     /// 协作式取消指定任务。返回是否找到了该任务。
     ///
-    /// 发送取消信号后，任务会在下一次让出执行权时退出；
-    /// 若任务内部不响应信号，请改用 [`TaskPool::abort`] 强制中止。
+    /// 取消后任务从池中移除，查询该 id 会得到 `None`（not_found）。
     pub fn cancel(&self, id: TaskId) -> bool {
         match self.inner.tasks.lock().unwrap().remove(&id) {
             Some(entry) => {
@@ -98,7 +136,7 @@ impl TaskPool {
         }
     }
 
-    /// 强制中止指定任务（不等待任务清理）。
+    /// 强制中止指定任务，并从池中移除。
     pub fn abort(&self, id: TaskId) -> bool {
         match self.inner.tasks.lock().unwrap().remove(&id) {
             Some(entry) => {
@@ -123,7 +161,24 @@ impl TaskPool {
         }
     }
 
-    /// 当前仍在池中登记的任务数。
+    /// 查询任务状态；任务不存在返回 `None`。
+    pub fn status(&self, id: TaskId) -> Option<TaskStatus> {
+        let tasks = self.inner.tasks.lock().unwrap();
+        tasks.get(&id).map(|e| e.state.lock().unwrap().status)
+    }
+
+    /// 读取已完成任务的结果（不消费，可重复查询）。
+    ///
+    /// 类型不匹配或任务未完成时返回 `None`。
+    pub fn result<T: Send + Sync + 'static>(&self, id: TaskId) -> Option<Arc<T>> {
+        let tasks = self.inner.tasks.lock().unwrap();
+        let entry = tasks.get(&id)?;
+        let state = entry.state.lock().unwrap();
+        let arc = state.result.as_ref()?.clone();
+        arc.downcast::<T>().ok()
+    }
+
+    /// 当前登记在池中的任务数（含已完成待查询的任务）。
     pub fn len(&self) -> usize {
         self.inner.tasks.lock().unwrap().len()
     }
@@ -144,11 +199,15 @@ pub struct TaskHandle<T> {
     id: TaskId,
     cancel: watch::Sender<bool>,
     abort: AbortHandle,
-    rx: oneshot::Receiver<T>,
+    /// 完成通知：任务结束后收到一个空信号。
+    rx: oneshot::Receiver<()>,
+    /// 共享状态，`await_task` 从这里取结果。
+    state: Arc<Mutex<TaskState>>,
     inner: Arc<Inner>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-impl<T> TaskHandle<T> {
+impl<T: Send + Sync + 'static> TaskHandle<T> {
     pub fn id(&self) -> TaskId {
         self.id
     }
@@ -166,37 +225,44 @@ impl<T> TaskHandle<T> {
 
     /// 等待任务结果。任务被取消或未正常产出结果时返回 `None`。
     ///
-    /// 取消时任务 future 会被内部 `select!` drop 掉，因此无需任务
-    /// 内部主动配合即可停止。
+    /// 注意：本方法会取走结果（一次性消费）；如需重复查询，
+    /// 请改用 [`TaskPool::result`]。
     pub async fn await_task(self) -> Option<T> {
-        self.rx.await.ok()
+        self.rx.await.ok()?;
+        let mut state = self.state.lock().unwrap();
+        let arc = state.result.take()?.downcast::<T>().ok()?;
+        Arc::try_unwrap(arc).ok()
     }
 }
 
 /// 任务包装：在「取消」与「任务完成」之间竞速。
 ///
-/// 无论走哪条分支，结束后都会从池中注销自己。
+/// 完成分支会把结果写入共享状态并保留在池中；
+/// 取消分支会把任务从池中移除。
 async fn run_task<F, T>(
     fut: F,
     mut cancel_rx: watch::Receiver<bool>,
-    result_tx: oneshot::Sender<T>,
+    done_tx: oneshot::Sender<()>,
+    state: Arc<Mutex<TaskState>>,
     inner: Arc<Inner>,
     id: TaskId,
 ) where
     F: Future<Output = T> + Send,
-    T: Send,
+    T: Send + Sync + 'static,
 {
     tokio::select! {
         _ = wait_cancelled(&mut cancel_rx) => {
-            // 收到取消信号：丢弃 result_tx，不发送结果
+            inner.tasks.lock().unwrap().remove(&id);
         }
         result = fut => {
-            let _ = result_tx.send(result);
+            {
+                let mut s = state.lock().unwrap();
+                s.status = TaskStatus::Completed;
+                s.result = Some(Arc::new(result));
+            }
+            let _ = done_tx.send(());
         }
     }
-
-    // 任务结束，从池中移除自己（幂等，重复移除无害）。
-    inner.tasks.lock().unwrap().remove(&id);
 }
 
 /// 等待取消信号变为 true；发送端全部 drop 时也退出。
@@ -217,31 +283,50 @@ mod tests {
     async fn await_returns_result() {
         let pool = TaskPool::new();
         let handle = pool.spawn(async { 1 + 1 });
+        let id = handle.id();
         assert_eq!(handle.await_task().await, Some(2));
-        assert!(pool.is_empty());
+        assert_eq!(pool.status(id), Some(TaskStatus::Completed));
     }
 
     #[tokio::test]
-    async fn cancel_returns_none() {
+    async fn status_and_result_after_completion() {
+        let pool = TaskPool::new();
+        let handle = pool.spawn(async { 42 });
+        assert_eq!(pool.status(handle.id()), Some(TaskStatus::Running));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(pool.status(handle.id()), Some(TaskStatus::Completed));
+        assert_eq!(pool.result::<i32>(handle.id()).map(|r| *r), Some(42));
+    }
+
+    #[tokio::test]
+    async fn result_can_be_queried_multiple_times() {
+        let pool = TaskPool::new();
+        let handle = pool.spawn(async { 7 });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(pool.result::<i32>(handle.id()).map(|r| *r), Some(7));
+        assert_eq!(pool.result::<i32>(handle.id()).map(|r| *r), Some(7));
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_none_and_removes_task() {
         let pool = TaskPool::new();
         let handle = pool.spawn(async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             42
         });
-        assert!(pool.cancel(handle.id()));
+        let id = handle.id();
+        assert!(pool.cancel(id));
         assert_eq!(handle.await_task().await, None);
+        assert_eq!(pool.status(id), None);
     }
 
     #[tokio::test]
     async fn many_tasks_run_concurrently() {
         let pool = TaskPool::new();
-        let handles: Vec<_> = (0..10)
-            .map(|i| pool.spawn(async move { i * 2 }))
-            .collect();
+        let handles: Vec<_> = (0..10).map(|i| pool.spawn(async move { i * 2 })).collect();
         for (i, h) in handles.into_iter().enumerate() {
             assert_eq!(h.await_task().await, Some(i * 2));
         }
-        assert!(pool.is_empty());
     }
 
     #[tokio::test]
