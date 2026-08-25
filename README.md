@@ -1,25 +1,33 @@
 # fibonacci-cli
 
-基于 **axum** 的斐波那契数列与并发任务池 HTTP 服务，提供：
+> **项目定位：这是一个 HTTP 服务，不是 CLI 工具。**
+> 项目最初是命令行程序（仓库名 `fibonacci-cli` 沿用至今），当前是基于 **axum** 的斐波那契数列与并发任务池 HTTP 服务。
+
+提供的接口：
 
 - `GET /fibonacci/:n` —— 返回第 `n` 个斐波那契数（`fib(0) = 0`，`fib(1) = 1`）
 - `GET /fibonacci/sequence/:n` —— 返回前 `n` 个斐波那契数组成的数组
+- `GET /health` —— 健康检查
 - `POST /task` —— 提交一个模拟耗时任务，返回 `task_id`
 - `GET /task/:id` —— 查询任务状态与结果
 
-内置 OpenAPI 文档（Swagger UI）与 `tracing` 结构化日志。
+内置 OpenAPI 文档（Swagger UI）、`tracing` 结构化日志与 `tower-http` CORS 支持。
 
 ## 项目结构
 
 ```
 .
-├── Cargo.toml                  # 项目配置（axum / tokio / serde / utoipa / tracing）
+├── Cargo.toml                  # 项目配置（axum / tokio / serde / utoipa / tracing / tower-http）
 ├── Dockerfile                  # 多阶段构建：编译阶段（rust:1.97）+ 运行阶段（debian:bookworm-slim）
 ├── .dockerignore
+├── LICENSE                     # MIT License
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # GitHub Actions CI（fmt + clippy + test）
 ├── src/
 │   ├── main.rs                 # HTTP 服务入口：路由、处理器、OpenAPI、日志中间件
 │   ├── concurrent_task_pool.rs # 基于 tokio 的并发任务池（spawn / cancel / await / 状态查询）
-│   └── utils.rs                # fibonacci / fibonacci_sequence 实现及单元测试
+│   └── utils.rs                # 三种斐波那契算法实现、基准测试与单元测试
 └── .gitignore
 ```
 
@@ -35,6 +43,8 @@ cargo run
 ```
 
 监听地址可通过环境变量 `ADDR` 覆盖（例如 `ADDR=0.0.0.0:8080 cargo run`）。
+
+> **CORS 说明**：当前配置允许**所有来源**的跨域请求（`CorsLayer::permissive()`），仅适用于开发环境；生产部署前请收紧为具体来源白名单。
 
 ## 使用 Docker 运行
 
@@ -102,6 +112,15 @@ curl http://127.0.0.1:3000/fibonacci/sequence/10
 
 ```json
 {"error": "n 过大：前 95 个斐波那契数超出 u64 范围（最大支持 n = 94）"}
+```
+
+### GET /health
+
+健康检查，用于探活。
+
+```bash
+curl http://127.0.0.1:3000/health
+# {"status":"ok"}
 ```
 
 ### POST /task
@@ -187,20 +206,56 @@ RUST_LOG=fibonacci_cli=info cargo run
 RUST_LOG=off cargo run
 ```
 
+## 斐波那契算法与性能对比
+
+`src/utils.rs` 内置三种算法，均以 `Option<u64>` 形式处理溢出（`n > 93` 返回 `None`）：
+
+| 算法 | 函数 | 时间复杂度 | 空间复杂度 | 说明 |
+| ---- | ---- | ---- | ---- | ---- |
+| 迭代 | `fibonacci_checked` | O(n) | O(1) | 基础实现，无递归开销 |
+| 递归 + 记忆化 | `fibonacci_memoized` | O(n) | O(n) | 自顶向下，`Vec` 缓存避免重复计算 |
+| 矩阵快速幂 | `fibonacci_matrix` | O(log n) | O(1) | 利用 `[[1,1],[1,0]]^n` 矩阵恒等式 |
+
+> 历史接口 `fibonacci` / `fibonacci_sequence` 保持 u64 返回不变；HTTP 接口内部使用 checked 版本并统一返回 400。
+
+**基准测试**（release 模式，Apple Silicon / Rust 1.97，单次测量仅供参考）：
+
+```text
+基准测试：计算 fib(50) = 12586269025
+  迭代 (checked)    375ns
+  递归 + 记忆化     2.166µs
+  矩阵快速幂        166ns
+```
+
+运行方式：`cargo test --release benchmark::bench_fib_50 -- --ignored --nocapture`
+
+结论：矩阵快速幂最快（O(log n)）；迭代实现常数项也极小；记忆化因递归调用与缓存访问开销最慢。三种算法在 fib(50) 量级下均为微秒级以下，实际差异可忽略。
+
 ## 测试
 
 ```bash
-# 运行单元测试（utils.rs 的 fibonacci 逻辑 + concurrent_task_pool.rs 的任务池逻辑）
+# 运行单元测试（13 个用例 + 1 个被忽略的性能基准）
 cargo test
 
 # 静态检查（把 warning 视为错误）
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 
-# 格式化代码
-cargo fmt
+# 格式化检查
+cargo fmt --check
 ```
+
+CI（`.github/workflows/ci.yml`）在每次 push / PR 时执行 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。
 
 测试覆盖：
 
-- `utils.rs`：边界值（`fib(0)`、`fib(1)`）、已知结果（`fib(10) = 55`、`fib(20) = 6765`、`fib(93)` 为 `u64` 上限）以及序列输出。
+- `utils.rs`：边界值（`fib(0)`、`fib(1)`）、已知结果（`fib(10) = 55`、`fib(20) = 6765`、`fib(93)` 为 `u64` 上限）、序列输出，以及三种算法在 0~93 全范围一致性、溢出（`n > 93` 返回 `None`）行为。
 - `concurrent_task_pool.rs`：任务完成取结果、取消返回 `None` 并移除、结果可重复查询、多任务并发、`cancel_all` 清空。
+- 性能基准（`#[ignore]`）：`cargo test --release benchmark::bench_fib_50 -- --ignored --nocapture`
+
+## 许可证
+
+MIT License，见 [LICENSE](LICENSE)。
+
+## AI 辅助生成声明
+
+本项目部分代码与文档由 AI 辅助生成，但均经过人工验证和修改（包括编译、单元测试、clippy 静态检查与接口实测）。
