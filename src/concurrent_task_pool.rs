@@ -8,17 +8,13 @@
 //!
 //! 只依赖 tokio，不引入任何 HTTP 依赖，可作为独立模块被引用。
 
-// 本模块是 bin crate 的公共 API 模块：cancel/abort/await/len 等能力
-// 当前未被 HTTP 层全部调用，但属于对外接口，故允许 dead_code。
-#![allow(dead_code)]
-
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 
 /// 任务的唯一标识。
@@ -67,15 +63,27 @@ struct Inner {
 /// 并发任务池。
 pub struct TaskPool {
     inner: Arc<Inner>,
+    /// 并发上限信号量：限制同时运行的任务数。
+    semaphore: Arc<Semaphore>,
 }
 
 impl TaskPool {
+    /// 默认最大并发数。
+    pub const DEFAULT_MAX_CONCURRENT: usize = 64;
+
     pub fn new() -> Self {
+        Self::with_max_concurrent(Self::DEFAULT_MAX_CONCURRENT)
+    }
+
+    /// 以指定的最大并发数创建任务池。
+    pub fn with_max_concurrent(max: usize) -> Self {
+        assert!(max > 0, "最大并发数必须大于 0");
         Self {
             inner: Arc::new(Inner {
                 tasks: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
             }),
+            semaphore: Arc::new(Semaphore::new(max)),
         }
     }
 
@@ -84,11 +92,20 @@ impl TaskPool {
     /// 任务被包在 `tokio::select!` 里：要么正常完成、要么响应取消信号。
     /// 任务完成后会保留在池中（状态为 [`TaskStatus::Completed`]），
     /// 以便通过 [`TaskPool::status`] / [`TaskPool::result`] 查询。
-    pub fn spawn<F, T>(&self, fut: F) -> TaskHandle<T>
+    pub async fn spawn<F, T>(&self, fut: F) -> TaskHandle<T>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + Sync + 'static,
     {
+        // 先获取许可：并发已满时在此等待，直到有任务结束释放许可。
+        // permit 随任务 move 进 run_task，任务结束时自动 drop 释放。
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Semaphore 永不关闭，acquire 不会失败");
+
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (done_tx, done_rx) = oneshot::channel();
@@ -101,6 +118,7 @@ impl TaskPool {
             state.clone(),
             self.inner.clone(),
             id,
+            permit,
         ));
 
         self.inner.tasks.lock().unwrap().insert(
@@ -246,6 +264,8 @@ async fn run_task<F, T>(
     state: Arc<Mutex<TaskState>>,
     inner: Arc<Inner>,
     id: TaskId,
+    // 持有并发许可直到本函数返回；drop 时自动释放名额
+    _permit: OwnedSemaphorePermit,
 ) where
     F: Future<Output = T> + Send,
     T: Send + Sync + 'static,
@@ -282,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn await_returns_result() {
         let pool = TaskPool::new();
-        let handle = pool.spawn(async { 1 + 1 });
+        let handle = pool.spawn(async { 1 + 1 }).await;
         let id = handle.id();
         assert_eq!(handle.await_task().await, Some(2));
         assert_eq!(pool.status(id), Some(TaskStatus::Completed));
@@ -291,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn status_and_result_after_completion() {
         let pool = TaskPool::new();
-        let handle = pool.spawn(async { 42 });
+        let handle = pool.spawn(async { 42 }).await;
         assert_eq!(pool.status(handle.id()), Some(TaskStatus::Running));
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(pool.status(handle.id()), Some(TaskStatus::Completed));
@@ -301,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn result_can_be_queried_multiple_times() {
         let pool = TaskPool::new();
-        let handle = pool.spawn(async { 7 });
+        let handle = pool.spawn(async { 7 }).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(pool.result::<i32>(handle.id()).map(|r| *r), Some(7));
         assert_eq!(pool.result::<i32>(handle.id()).map(|r| *r), Some(7));
@@ -310,10 +330,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_returns_none_and_removes_task() {
         let pool = TaskPool::new();
-        let handle = pool.spawn(async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            42
-        });
+        let handle = pool
+            .spawn(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                42
+            })
+            .await;
         let id = handle.id();
         assert!(pool.cancel(id));
         assert_eq!(handle.await_task().await, None);
@@ -323,7 +345,10 @@ mod tests {
     #[tokio::test]
     async fn many_tasks_run_concurrently() {
         let pool = TaskPool::new();
-        let handles: Vec<_> = (0..10).map(|i| pool.spawn(async move { i * 2 })).collect();
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            handles.push(pool.spawn(async move { i * 2 }).await);
+        }
         for (i, h) in handles.into_iter().enumerate() {
             assert_eq!(h.await_task().await, Some(i * 2));
         }
@@ -336,10 +361,46 @@ mod tests {
             pool.spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 i
-            });
+            })
+            .await;
         }
         assert_eq!(pool.len(), 5);
         pool.cancel_all();
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_limit_is_enforced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = Arc::new(TaskPool::with_max_concurrent(2));
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+
+        // 并发提交 5 个任务，每个任务 sleep 50ms
+        let mut submissions = Vec::new();
+        for i in 0..5 {
+            let pool = pool.clone();
+            let running = running.clone();
+            let max_observed = max_observed.clone();
+            submissions.push(tokio::spawn(async move {
+                pool.spawn(async move {
+                    let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_observed.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    i
+                })
+                .await
+            }));
+        }
+
+        for s in submissions {
+            s.await.unwrap();
+        }
+
+        let peak = max_observed.load(Ordering::SeqCst);
+        assert!(peak >= 2, "应观察到至少 2 个任务并发，实际峰值 {peak}");
+        assert!(peak <= 2, "并发数不应超过上限 2，实际峰值 {peak}");
     }
 }

@@ -25,9 +25,12 @@
 │   └── workflows/
 │       └── ci.yml              # GitHub Actions CI（fmt + clippy + test）
 ├── src/
-│   ├── main.rs                 # HTTP 服务入口：路由、处理器、OpenAPI、日志中间件
-│   ├── concurrent_task_pool.rs # 基于 tokio 的并发任务池（spawn / cancel / await / 状态查询）
+│   ├── main.rs                 # 程序入口：初始化 tracing 与任务池，绑定端口并启动服务
+│   ├── lib.rs                  # 库入口：路由、处理器、OpenAPI、日志中间件、app() 工厂
+│   ├── concurrent_task_pool.rs # 基于 tokio 的并发任务池（spawn / cancel / await / 状态查询 / 并发限制）
 │   └── utils.rs                # 三种斐波那契算法实现、基准测试与单元测试
+├── tests/
+│   └── http_test.rs            # HTTP 集成测试（tower::ServiceExt + oneshot）
 └── .gitignore
 ```
 
@@ -173,6 +176,16 @@ curl http://127.0.0.1:3000/task/0
 {"status": "not_found"}
 ```
 
+## 任务池并发限制
+
+`TaskPool` 内置 `tokio::sync::Semaphore`，限制同一时刻最多运行的任务数：
+
+- 默认上限为 64（`TaskPool::DEFAULT_MAX_CONCURRENT`）
+- 可用 `TaskPool::with_max_concurrent(max)` 自定义上限
+- 提交任务时若并发已满，`spawn` 会等待已有任务结束释放许可后才启动新任务，防止资源耗尽
+
+许可随任务结束自动释放（无论正常完成还是被取消/中止）。
+
 ## OpenAPI 文档（Swagger UI）
 
 服务启动后，可通过以下地址访问接口文档：
@@ -234,7 +247,7 @@ RUST_LOG=off cargo run
 ## 测试
 
 ```bash
-# 运行单元测试（13 个用例 + 1 个被忽略的性能基准）
+# 运行单元测试 + 集成测试（14 个用例 + 1 个被忽略的性能基准）
 cargo test
 
 # 静态检查（把 warning 视为错误）
@@ -249,7 +262,8 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 时执行 `cargo fmt --che
 测试覆盖：
 
 - `utils.rs`：边界值（`fib(0)`、`fib(1)`）、已知结果（`fib(10) = 55`、`fib(20) = 6765`、`fib(93)` 为 `u64` 上限）、序列输出，以及三种算法在 0~93 全范围一致性、溢出（`n > 93` 返回 `None`）行为。
-- `concurrent_task_pool.rs`：任务完成取结果、取消返回 `None` 并移除、结果可重复查询、多任务并发、`cancel_all` 清空。
+- `concurrent_task_pool.rs`：任务完成取结果、取消返回 `None` 并移除、结果可重复查询、多任务并发、`cancel_all` 清空、并发上限限制。
+- `tests/http_test.rs`（HTTP 集成测试）：使用 `tower::ServiceExt::oneshot` 对 `app()` 发起真实请求，覆盖 `/health`、`/fibonacci`、`/fibonacci/sequence`、`/task` 接口的状态码与响应体。
 - 性能基准（`#[ignore]`）：`cargo test --release benchmark::bench_fib_50 -- --ignored --nocapture`
 
 ## 许可证
